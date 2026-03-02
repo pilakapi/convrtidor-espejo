@@ -1,81 +1,74 @@
+// server.js
 const express = require("express");
 const { Pool } = require("pg");
 const { spawn } = require("child_process");
-const fs = require("fs");
 const path = require("path");
+const fs = require("fs");
 
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-
+// Conexión a Neon
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
-const processes = {};
+// Carpeta temporal para HLS
+const HLS_DIR = path.join(__dirname, "hls");
+if (!fs.existsSync(HLS_DIR)) fs.mkdirSync(HLS_DIR);
 
 // Crear canal
 app.post("/channel", async (req, res) => {
   const { name, sourceUrl, logoUrl } = req.body;
 
-  if (!name || !sourceUrl || !logoUrl)
-    return res.json({ error: "Faltan datos" });
+  if (!name || !sourceUrl || !logoUrl) {
+    return res.status(400).json({ error: "Faltan campos" });
+  }
 
-  const outputDir = `streams/${name}`;
-  fs.mkdirSync(outputDir, { recursive: true });
+  try {
+    // Guardar en Neon
+    await pool.query(
+      "INSERT INTO channels(name, source_url, logo_url) VALUES($1, $2, $3) ON CONFLICT (name) DO NOTHING",
+      [name, sourceUrl, logoUrl]
+    );
 
-  const outputM3U8 = `${outputDir}/index.m3u8`;
+    // Directorio del canal
+    const channelDir = path.join(HLS_DIR, name);
+    if (!fs.existsSync(channelDir)) fs.mkdirSync(channelDir);
 
-  await pool.query(
-    "INSERT INTO channels (name, source_url, logo_url, output_path) VALUES ($1,$2,$3,$4)",
-    [name, sourceUrl, logoUrl, outputM3U8]
-  );
+    // Archivo de salida HLS
+    const output = path.join(channelDir, "index.m3u8");
 
-  startStream(name, sourceUrl, logoUrl, outputM3U8);
+    // Ejecutar FFmpeg para generar HLS con logo
+    const ffmpeg = spawn("ffmpeg", [
+      "-i", sourceUrl,
+      "-vf", `movie=${logoUrl} [logo]; [in][logo] overlay=W-w-10:10 [out]`,
+      "-c:a", "copy",
+      "-f", "hls",
+      "-hls_time", "6",
+      "-hls_list_size", "5",
+      "-hls_flags", "delete_segments",
+      output
+    ]);
 
-  res.json({
-    message: "Canal creado",
-    url: `${req.protocol}://${req.get("host")}/live/${name}.m3u8`
-  });
+    ffmpeg.stderr.on("data", data => console.log(`FFmpeg: ${data}`));
+    ffmpeg.on("close", code => {
+      if (code !== 0) console.log(`FFmpeg salió con código ${code}`);
+    });
+
+    // URL HTTPS final
+    const url = `https://${req.headers.host}/live/${name}.m3u8`;
+    res.json({ message: "Canal creado", url });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error creando canal" });
+  }
 });
 
-// Iniciar FFmpeg
-function startStream(name, sourceUrl, logoUrl, output) {
+// Servir los streams
+app.use("/live", express.static(HLS_DIR));
 
-  const ffmpeg = spawn("ffmpeg", [
-    "-i", sourceUrl,
-    "-i", logoUrl,
-    "-filter_complex", "overlay=W-w-20:20",
-    "-c:a", "copy",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-tune", "zerolatency",
-    "-b:v", "1500k",
-    "-f", "hls",
-    "-hls_time", "4",
-    "-hls_list_size", "6",
-    "-hls_flags", "delete_segments",
-    output
-  ]);
-
-  processes[name] = ffmpeg;
-
-  ffmpeg.on("close", () => {
-    console.log(`Stream ${name} detenido`);
-  });
-}
-
-// Servir canal
-app.get("/live/:name.m3u8", (req, res) => {
-  const file = path.join(__dirname, "streams", req.params.name, "index.m3u8");
-  res.sendFile(file);
-});
-
-// Servir segmentos
-app.use("/streams", express.static("streams"));
-
-app.listen(PORT, () => {
-  console.log("Servidor multi-canal iniciado");
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor multicanal iniciado en puerto ${PORT}`));
