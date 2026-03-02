@@ -1,5 +1,6 @@
 FROM node:18-alpine
 
+# Instalar FFmpeg
 RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
@@ -8,4 +9,4 @@ COPY . .
 RUN npm install
 
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
